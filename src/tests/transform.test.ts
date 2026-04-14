@@ -11,7 +11,6 @@ import {
   isInsecure,
   mergeBetaHeaders,
   mergeHeaders,
-  prefixToolNames,
   prependClaudeCodeIdentity,
   rewriteRequestBody,
   rewriteUrl,
@@ -138,93 +137,26 @@ describe('setOAuthHeaders', () => {
   })
 })
 
-describe('prefixToolNames', () => {
-  test('prefixes tool definition names', () => {
-    const body = JSON.stringify({
-      tools: [
-        { name: 'read_file', type: 'function' },
-        { name: 'write_file', type: 'function' },
-      ],
-    })
-    const result = JSON.parse(prefixToolNames(body))
-    expect(result.tools[0].name).toBe('mcp_read_file')
-    expect(result.tools[1].name).toBe('mcp_write_file')
-  })
-
-  test('prefixes tool_use block names in messages', () => {
-    const body = JSON.stringify({
-      messages: [
-        {
-          role: 'assistant',
-          content: [
-            { type: 'tool_use', name: 'bash', id: '1' },
-            { type: 'text', text: 'hello' },
-          ],
-        },
-      ],
-    })
-    const result = JSON.parse(prefixToolNames(body))
-    expect(result.messages[0].content[0].name).toBe('mcp_bash')
-    expect(result.messages[0].content[1].type).toBe('text')
-  })
-
-  test('does not prefix non-tool_use blocks', () => {
-    const body = JSON.stringify({
-      messages: [
-        {
-          role: 'user',
-          content: [{ type: 'text', text: 'hello' }],
-        },
-      ],
-    })
-    const result = JSON.parse(prefixToolNames(body))
-    expect(result.messages[0].content[0]).toEqual({
-      type: 'text',
-      text: 'hello',
-    })
-  })
-
-  test('handles missing tools and messages gracefully', () => {
-    const body = JSON.stringify({ model: 'claude-3' })
-    const result = JSON.parse(prefixToolNames(body))
-    expect(result.model).toBe('claude-3')
-  })
-
-  test('returns original string on invalid JSON', () => {
-    const body = 'not valid json'
-    expect(prefixToolNames(body)).toBe(body)
-  })
-
-  test('handles tools without names', () => {
-    const body = JSON.stringify({
-      tools: [{ type: 'function' }],
-    })
-    const result = JSON.parse(prefixToolNames(body))
-    expect(result.tools[0].name).toBeUndefined()
-  })
-})
-
 describe('stripToolPrefix', () => {
-  test('strips mcp_ prefix from tool names', () => {
-    const text = '{"name": "mcp_read_file"}'
-    expect(stripToolPrefix(text)).toBe('{"name": "read_file"}')
+  test('normalizes TodoWrite to todowrite', () => {
+    const text = '{"name": "TodoWrite"}'
+    expect(stripToolPrefix(text)).toBe('{"name":"todowrite"}')
   })
 
-  test('strips multiple prefixed names', () => {
-    const text = '{"name": "mcp_tool_a"} and {"name": "mcp_tool_b"}'
+  test('normalizes multiple TodoWrite names', () => {
+    const text = '{"name": "TodoWrite"} and {"name": "TodoWrite"}'
     const result = stripToolPrefix(text)
-    expect(result).toContain('"name": "tool_a"')
-    expect(result).toContain('"name": "tool_b"')
+    expect(result).toContain('"name":"todowrite"')
   })
 
-  test('does not strip names without mcp_ prefix', () => {
+  test('does not rewrite non-blocked names', () => {
     const text = '{"name": "regular_tool"}'
     expect(stripToolPrefix(text)).toBe(text)
   })
 
   test('handles whitespace variations in JSON', () => {
-    const text = '{"name"  :  "mcp_tool"}'
-    expect(stripToolPrefix(text)).toBe('{"name": "tool"}')
+    const text = '{"name"  :  "TodoWrite"}'
+    expect(stripToolPrefix(text)).toBe('{"name":"todowrite"}')
   })
 })
 
@@ -449,10 +381,10 @@ describe('experimentalKeepSystemPrompt', () => {
 })
 
 describe('createStrippedStream', () => {
-  test('strips tool prefixes from streamed response body', async () => {
+  test('normalizes blocked tool names from streamed response body', async () => {
     const chunks = [
-      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
-      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_read"}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"TodoWrite"}}\n\n',
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"bash"}}\n\n',
     ]
 
     const stream = new ReadableStream({
@@ -469,10 +401,9 @@ describe('createStrippedStream', () => {
     const stripped = createStrippedStream(original)
 
     const text = await stripped.text()
-    expect(text).toContain('"name": "bash"')
-    expect(text).toContain('"name": "read"')
-    expect(text).not.toContain('mcp_bash')
-    expect(text).not.toContain('mcp_read')
+    expect(text).toContain('"name":"todowrite"')
+    expect(text).toContain('"name":"bash"')
+    expect(text).not.toContain('TodoWrite')
   })
 
   test('preserves response status and headers', async () => {
@@ -663,15 +594,32 @@ describe('prependClaudeCodeIdentity', () => {
 })
 
 describe('rewriteRequestBody', () => {
-  test('prefixes tool names and rewrites system prompt', () => {
+  test('rewrites system prompt without renaming non-blocked tools', () => {
     const body = JSON.stringify({
       tools: [{ name: 'bash', type: 'function' }],
       messages: [{ role: 'user', content: 'hello world test message' }],
       system: 'You are a helpful assistant.',
     })
     const result = JSON.parse(rewriteRequestBody(body))
-    expect(result.tools[0].name).toBe('mcp_bash')
+    expect(result.tools[0].name).toBe('bash')
     expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
+  })
+
+  test('renames blocked todowrite tool names in tools and tool_use blocks', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'todowrite', type: 'function' }],
+      messages: [
+        { role: 'user', content: 'hello' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'todowrite', id: 'tool_1' }],
+        },
+      ],
+    })
+
+    const result = JSON.parse(rewriteRequestBody(body))
+    expect(result.tools[0].name).toBe('TodoWrite')
+    expect(result.messages[1].content[0].name).toBe('TodoWrite')
   })
 
   test('handles missing system field', () => {
@@ -777,7 +725,7 @@ describe('rewriteRequestBody', () => {
           "content": [
             {
               "id": "tool_1",
-              "name": "mcp_bash",
+              "name": "bash",
               "type": "tool_use",
             },
             {
@@ -956,10 +904,13 @@ describe('rewriteRequestBody', () => {
       expect(result.system[0].text).toContain(CLAUDE_CODE_IDENTITY)
     })
 
-    test('still prefixes tool names', () => {
+    test('still renames blocked tool names only', () => {
       process.env.EXPERIMENTAL_KEEP_SYSTEM_PROMPT = '1'
       const body = JSON.stringify({
-        tools: [{ name: 'bash', type: 'function' }],
+        tools: [
+          { name: 'todowrite', type: 'function' },
+          { name: 'bash', type: 'function' },
+        ],
         messages: [
           {
             role: 'user',
@@ -967,15 +918,20 @@ describe('rewriteRequestBody', () => {
           },
           {
             role: 'assistant',
-            content: [{ type: 'tool_use', name: 'bash', id: '1' }],
+            content: [
+              { type: 'tool_use', name: 'todowrite', id: '1' },
+              { type: 'tool_use', name: 'bash', id: '2' },
+            ],
           },
         ],
         system: 'Instructions.',
       })
       const result = JSON.parse(rewriteRequestBody(body))
 
-      expect(result.tools[0].name).toBe('mcp_bash')
-      expect(result.messages[1].content[0].name).toBe('mcp_bash')
+      expect(result.tools[0].name).toBe('TodoWrite')
+      expect(result.tools[1].name).toBe('bash')
+      expect(result.messages[1].content[0].name).toBe('TodoWrite')
+      expect(result.messages[1].content[1].name).toBe('bash')
     })
   })
 })

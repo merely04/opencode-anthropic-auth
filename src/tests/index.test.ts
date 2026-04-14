@@ -166,7 +166,7 @@ describe('auth.loader', () => {
     expect(result.fetch).toBeFunction()
   })
 
-  test('fetch wrapper sets OAuth headers and prefixes tools', async () => {
+  test('fetch wrapper sets OAuth headers and keeps non-blocked tool names', async () => {
     let capturedHeaders: Headers | undefined
     let capturedBody: string | undefined
 
@@ -205,8 +205,8 @@ describe('auth.loader', () => {
     expect(capturedHeaders!.get('anthropic-beta')).toContain('oauth-2025-04-20')
 
     const parsedBody = JSON.parse(capturedBody!)
-    // Tool name should be prefixed
-    expect(parsedBody.tools[0].name).toBe('mcp_bash')
+    // Non-blocked tool names should pass through unchanged
+    expect(parsedBody.tools[0].name).toBe('bash')
     // After relocation, system should only contain the identity block
     expect(parsedBody.system).toHaveLength(1)
     expect(parsedBody.system[0].text).toBe(
@@ -372,7 +372,7 @@ describe('auth.loader', () => {
       start(controller) {
         controller.enqueue(
           encoder.encode(
-            'data: {"content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
+            'data: {"content_block":{"type":"tool_use","name":"TodoWrite"}}\n\n',
           ),
         )
         controller.close()
@@ -404,8 +404,8 @@ describe('auth.loader', () => {
     )
 
     const text = await response.text()
-    expect(text).toContain('"name": "bash"')
-    expect(text).not.toContain('mcp_bash')
+    expect(text).toContain('"name":"todowrite"')
+    expect(text).not.toContain('TodoWrite')
   })
 
   test('concurrent expired token refresh should deduplicate to a single token request', async () => {

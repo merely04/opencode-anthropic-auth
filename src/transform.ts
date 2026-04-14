@@ -6,11 +6,14 @@ import {
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
   TEXT_REPLACEMENTS,
-  TOOL_PREFIX,
   USER_AGENT,
 } from './constants'
 
 export type FetchInput = string | URL | Request
+
+const OUTBOUND_TOOL_NAME_RENAMES: Record<string, string> = {
+  todowrite: 'TodoWrite',
+}
 
 /**
  * Merge headers from a Request object and/or a RequestInit headers value
@@ -79,59 +82,15 @@ export function setOAuthHeaders(
 }
 
 /**
- * Add TOOL_PREFIX to tool names in the request body.
- * Prefixes both tool definitions and tool_use blocks in messages.
- */
-export function prefixToolNames(body: string): string {
-  try {
-    const parsed = JSON.parse(body)
-
-    if (parsed.tools && Array.isArray(parsed.tools)) {
-      parsed.tools = parsed.tools.map(
-        (tool: { name?: string; [k: string]: unknown }) => ({
-          ...tool,
-          name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
-        }),
-      )
-    }
-
-    if (parsed.messages && Array.isArray(parsed.messages)) {
-      parsed.messages = parsed.messages.map(
-        (msg: {
-          content?: Array<{
-            type: string
-            name?: string
-            [k: string]: unknown
-          }>
-          [k: string]: unknown
-        }) => {
-          if (msg.content && Array.isArray(msg.content)) {
-            msg.content = msg.content.map((block) => {
-              if (block.type === 'tool_use' && block.name) {
-                return {
-                  ...block,
-                  name: `${TOOL_PREFIX}${block.name}`,
-                }
-              }
-              return block
-            })
-          }
-          return msg
-        },
-      )
-    }
-
-    return JSON.stringify(parsed)
-  } catch {
-    return body
-  }
-}
-
-/**
- * Strip TOOL_PREFIX from tool names in streaming response text.
+ * Normalize renamed tool names in streaming response text.
  */
 export function stripToolPrefix(text: string): string {
-  return text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"')
+  let result = text
+  for (const [name, renamed] of Object.entries(OUTBOUND_TOOL_NAME_RENAMES)) {
+    const pattern = new RegExp(`"name"\\s*:\\s*"${renamed}"`, 'g')
+    result = result.replace(pattern, `"name":"${name}"`)
+  }
+  return result
 }
 
 /**
@@ -335,7 +294,7 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 }
 
 /**
- * Rewrite the full request body: sanitize system prompt and prefix tool names.
+ * Rewrite the full request body: sanitize system prompt and normalize tool names.
  */
 export function rewriteRequestBody(body: string): string {
   try {
@@ -401,12 +360,15 @@ export function rewriteRequestBody(body: string): string {
       identityBlock.text = `${billingHeader}\n\n${CLAUDE_CODE_IDENTITY}`
     }
 
-    // Prefix tool names
+    // Normalize blocked tool names for outbound requests.
     if (parsed.tools && Array.isArray(parsed.tools)) {
       parsed.tools = parsed.tools.map(
         (tool: { name?: string; [k: string]: unknown }) => ({
           ...tool,
-          name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+          name:
+            typeof tool.name === 'string'
+              ? (OUTBOUND_TOOL_NAME_RENAMES[tool.name] ?? tool.name)
+              : tool.name,
         }),
       )
     }
@@ -424,7 +386,10 @@ export function rewriteRequestBody(body: string): string {
           if (msg.content && Array.isArray(msg.content)) {
             msg.content = msg.content.map((block) => {
               if (block.type === 'tool_use' && block.name) {
-                return { ...block, name: `${TOOL_PREFIX}${block.name}` }
+                return {
+                  ...block,
+                  name: OUTBOUND_TOOL_NAME_RENAMES[block.name] ?? block.name,
+                }
               }
               return block
             })

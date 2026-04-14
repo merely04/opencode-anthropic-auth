@@ -292,15 +292,15 @@ You are a Claude agent, built on Anthropic's Claude Agent SDK."
   ],
   "tools": [
     {
-      "name": "mcp_bash",
+      "name": "bash",
       "type": "function",
     },
     {
-      "name": "mcp_read",
+      "name": "read",
       "type": "function",
     },
     {
-      "name": "mcp_edit",
+      "name": "edit",
       "type": "function",
     },
   ],

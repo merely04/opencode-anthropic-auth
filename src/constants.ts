@@ -19,8 +19,6 @@ export const OAUTH_SCOPES = [
   'user:file_upload',
 ]
 
-export const TOOL_PREFIX = 'mcp_'
-
 export const REQUIRED_BETAS = [
   'oauth-2025-04-20',
   'interleaved-thinking-2025-05-14',
