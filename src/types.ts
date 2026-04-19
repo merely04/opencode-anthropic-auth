@@ -2,6 +2,7 @@
 export interface AccountsConfig {
   version: 1
   activeAccountId: string
+  primaryAccountId?: string
   thresholds?: {
     fiveHour?: number
     sevenDay?: number

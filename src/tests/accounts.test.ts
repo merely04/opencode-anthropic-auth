@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -7,6 +7,7 @@ import {
   configPath,
   createAccountRefresher,
   createInitialConfig,
+  createMutex,
   getActiveAccount,
   loadConfig,
   refreshWithThrottle,
@@ -20,6 +21,7 @@ function createConfig(): AccountsConfig {
   return {
     version: 1,
     activeAccountId: 'account-1',
+    primaryAccountId: 'account-1',
     thresholds: {
       fiveHour: 0.8,
       sevenDay: 0.8,
@@ -91,8 +93,8 @@ describe('accounts config helpers', () => {
     }
   })
 
-  test('loadConfig returns null for a missing file', async () => {
-    expect(await loadConfig()).toBeNull()
+  test('loadConfig distinguishes a missing file', async () => {
+    expect(await loadConfig()).toEqual({ status: 'not_found' })
   })
 
   test('loadConfig parses a valid config', async () => {
@@ -102,19 +104,22 @@ describe('accounts config helpers', () => {
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(config)}\n`, 'utf8')
 
-    expect(await loadConfig()).toEqual(config)
+    expect(await loadConfig()).toEqual({ status: 'ok', config })
   })
 
-  test('loadConfig returns null for malformed JSON', async () => {
+  test('loadConfig distinguishes malformed JSON', async () => {
     const path = configPath()
 
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, '{not-json', 'utf8')
 
-    expect(await loadConfig()).toBeNull()
+    expect(await loadConfig()).toEqual({
+      status: 'invalid',
+      error: "JSON Parse error: Expected '}'",
+    })
   })
 
-  test('loadConfig returns null for a non-numeric primaryRecoveryIntervalMs', async () => {
+  test('loadConfig reports invalid schema without overwriting the file', async () => {
     const path = configPath()
     const config = {
       ...createConfig(),
@@ -124,7 +129,10 @@ describe('accounts config helpers', () => {
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify(config)}\n`, 'utf8')
 
-    expect(await loadConfig()).toBeNull()
+    expect(await loadConfig()).toEqual({
+      status: 'invalid',
+      error: 'Config file is malformed',
+    })
   })
 
   test('saveConfig writes valid JSON', async () => {
@@ -134,6 +142,15 @@ describe('accounts config helpers', () => {
 
     const raw = await readFile(configPath(), 'utf8')
     expect(JSON.parse(raw)).toEqual(config)
+  })
+
+  test('saveConfig writes the config file with 0o600 permissions', async () => {
+    const config = createConfig()
+
+    await saveConfig(config)
+
+    const stats = await stat(configPath())
+    expect(stats.mode & 0o777).toBe(0o600)
   })
 
   test('addAccount appends an account with a generated UUID', () => {
@@ -180,6 +197,18 @@ describe('accounts config helpers', () => {
 
     expect(result?.activeAccountId).toBe('account-2')
     expect(result?.accounts[0]?.id).toBe('account-2')
+  })
+
+  test('removeAccount moves primaryAccountId when removing the primary account', () => {
+    const result = removeAccount(createConfig(), 'account-1')
+
+    expect(result?.primaryAccountId).toBe('account-2')
+  })
+
+  test('removeAccount preserves explicit primaryAccountId when removing a non-primary account', () => {
+    const result = removeAccount(createConfig(), 'account-2')
+
+    expect(result?.primaryAccountId).toBe('account-1')
   })
 
   test('removeAccount returns null when removing the last account', () => {
@@ -229,6 +258,7 @@ describe('accounts config helpers', () => {
     expect(config.version).toBe(1)
     expect(config.accounts).toHaveLength(1)
     expect(config.activeAccountId).toBe(account.id)
+    expect(config.primaryAccountId).toBe(account.id)
     expect(account.refresh).toBe('refresh-initial')
     expect(account.access).toBe('access-initial')
     expect(account.expires).toBe(1_700_000_000_000)
@@ -281,6 +311,44 @@ describe('accounts config helpers', () => {
     expect(firstToken).toBe('fresh-access')
     expect(secondToken).toBe('fresh-access')
     expect(fetchCalls).toBe(1)
+  })
+
+  test('createMutex serializes async state transitions', async () => {
+    const mutex = createMutex()
+    const events: string[] = []
+
+    const run = async (label: string, releaseSignal?: Promise<void>) => {
+      const release = await mutex.acquire()
+      try {
+        events.push(`${label}:start`)
+        await releaseSignal
+        events.push(`${label}:end`)
+      } finally {
+        release()
+      }
+    }
+
+    let resolveFirst: (() => void) | undefined
+    const first = run(
+      'first',
+      new Promise<void>((resolve) => {
+        resolveFirst = resolve
+      }),
+    )
+    const second = run('second')
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(events).toEqual(['first:start'])
+
+    resolveFirst?.()
+    await Promise.all([first, second])
+
+    expect(events).toEqual([
+      'first:start',
+      'first:end',
+      'second:start',
+      'second:end',
+    ])
   })
 
   test('createAccountRefresher calls onTokensRefreshed', async () => {

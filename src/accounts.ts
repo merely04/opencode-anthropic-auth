@@ -16,6 +16,11 @@ type TokenResponse = {
   expires_in: number
 }
 
+export type LoadConfigResult =
+  | { status: 'ok'; config: AccountsConfig }
+  | { status: 'not_found' }
+  | { status: 'invalid'; error: string }
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -53,6 +58,15 @@ function isAccountsConfig(value: unknown): value is AccountsConfig {
 
   if (!value.accounts.some((account) => account.id === value.activeAccountId)) {
     return false
+  }
+
+  if (typeof value.primaryAccountId !== 'undefined') {
+    if (typeof value.primaryAccountId !== 'string') return false
+    if (
+      !value.accounts.some((account) => account.id === value.primaryAccountId)
+    ) {
+      return false
+    }
   }
 
   if (typeof value.proactiveSwitch !== 'undefined') {
@@ -116,7 +130,7 @@ function delay(ms: number): Promise<void> {
   })
 }
 
-function isNetworkError(error: unknown): boolean {
+export function isNetworkError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   if (error.message.includes('fetch failed')) return true
   if (!('code' in error)) return false
@@ -127,6 +141,39 @@ function isNetworkError(error: unknown): boolean {
     error.code === 'ETIMEDOUT' ||
     error.code === 'UND_ERR_CONNECT_TIMEOUT'
   )
+}
+
+/** Simple async mutex for serializing state transitions. */
+export function createMutex(): {
+  acquire(): Promise<() => void>
+} {
+  let current = Promise.resolve()
+
+  return {
+    async acquire() {
+      let release: (() => void) | undefined
+      const next = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const previous = current
+      current = next
+      await previous
+      if (!release) {
+        throw new Error('Mutex release was not initialized')
+      }
+      return release
+    },
+  }
+}
+
+export function isAuthError(error: unknown): boolean {
+  if (!(error instanceof Error)) return true
+  if (error.message.includes('ENOSPC')) return false
+  if (error.message.includes('EPERM')) return false
+  if (error.message.includes('EROFS')) return false
+  if (error.message.includes('Token refresh failed')) return true
+  if (isNetworkError(error)) return true
+  return true
 }
 
 async function refreshAccountTokens(opts: {
@@ -166,8 +213,8 @@ async function refreshAccountTokens(opts: {
           continue
         }
 
-        const body = await response.text().catch(() => '')
-        throw new Error(`Token refresh failed: ${response.status} — ${body}`)
+        await response.body?.cancel()
+        throw new Error(`Token refresh failed: ${response.status}`)
       }
 
       const json = (await response.json()) as TokenResponse
@@ -199,13 +246,28 @@ export function configPath(): string {
 }
 
 /** Load multi-account config from disk. */
-export async function loadConfig(): Promise<AccountsConfig | null> {
+export async function loadConfig(): Promise<LoadConfigResult> {
   try {
     const raw = await readFile(configPath(), 'utf8')
     const parsed = JSON.parse(raw) as unknown
-    return isAccountsConfig(parsed) ? parsed : null
-  } catch {
-    return null
+    if (!isAccountsConfig(parsed)) {
+      return { status: 'invalid', error: 'Config file is malformed' }
+    }
+    return { status: 'ok', config: parsed }
+  } catch (error) {
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      error.code === 'ENOENT'
+    ) {
+      return { status: 'not_found' }
+    }
+
+    return {
+      status: 'invalid',
+      error: error instanceof Error ? error.message : String(error),
+    }
   }
 }
 
@@ -218,7 +280,10 @@ export async function saveConfig(config: AccountsConfig): Promise<void> {
   await mkdir(directory, { recursive: true })
 
   try {
-    await writeFile(tempPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+    await writeFile(tempPath, `${JSON.stringify(config, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
     await rename(tempPath, path)
   } catch (error) {
     await unlink(tempPath).catch(() => undefined)
@@ -243,6 +308,7 @@ export function addAccount(
       ...config,
       activeAccountId:
         config.accounts.length === 0 ? account.id : config.activeAccountId,
+      primaryAccountId: config.primaryAccountId,
       accounts: [...config.accounts, account],
     },
     accountId: account.id,
@@ -259,6 +325,10 @@ export function removeAccount(
   if (accounts.length === 0) return null
   const nextActiveAccountId = accounts[0]?.id
   if (!nextActiveAccountId) return null
+  const nextPrimaryAccountId =
+    config.primaryAccountId === accountId
+      ? accounts[0]?.id
+      : config.primaryAccountId
 
   return {
     ...config,
@@ -266,6 +336,7 @@ export function removeAccount(
       config.activeAccountId === accountId
         ? nextActiveAccountId
         : config.activeAccountId,
+    primaryAccountId: nextPrimaryAccountId,
     accounts,
   }
 }
@@ -306,6 +377,7 @@ export function createInitialConfig(auth: {
   return {
     version: 1,
     activeAccountId: account.id,
+    primaryAccountId: account.id,
     accounts: [account],
   }
 }

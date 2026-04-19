@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { configPath } from '../accounts'
 import { AnthropicAuthPlugin } from '../index'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -62,6 +66,46 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
   })) as Promise<any>
 }
 
+async function writeMultiAccountConfig(
+  overrides: Record<string, unknown> = {},
+) {
+  const config = {
+    version: 1,
+    activeAccountId: 'account-1',
+    primaryAccountId: 'account-1',
+    proactiveSwitch: false,
+    maxRetries: 1,
+    accounts: [
+      {
+        id: 'account-1',
+        refresh: 'refresh-1',
+        access: 'access-1',
+        expires: Date.now() + 100_000,
+        addedAt: '2024-01-01T00:00:00.000Z',
+      },
+      {
+        id: 'account-2',
+        refresh: 'refresh-2',
+        access: 'access-2',
+        expires: Date.now() + 100_000,
+        addedAt: '2024-01-02T00:00:00.000Z',
+      },
+      {
+        id: 'account-3',
+        refresh: 'refresh-3',
+        access: 'access-3',
+        expires: Date.now() + 100_000,
+        addedAt: '2024-01-03T00:00:00.000Z',
+      },
+    ],
+    ...overrides,
+  }
+
+  const path = configPath()
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, `${JSON.stringify(config)}\n`, 'utf8')
+}
+
 describe('AnthropicAuthPlugin', () => {
   test('returns an object with auth properties', async () => {
     const plugin = await getPlugin()
@@ -122,15 +166,38 @@ describe('auth.methods', () => {
 describe('auth.loader', () => {
   const originalFetch = globalThis.fetch
   const originalSetTimeout = globalThis.setTimeout
+  const originalSetInterval = globalThis.setInterval
+  const originalClearTimeout = globalThis.clearTimeout
+  const originalClearInterval = globalThis.clearInterval
+  const originalConfigHome = process.env.XDG_CONFIG_HOME
+  let tempConfigHome = ''
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    tempConfigHome = await mkdtemp(join(tmpdir(), 'opencode-anthropic-auth-'))
+    process.env.XDG_CONFIG_HOME = tempConfigHome
     globalThis.fetch = originalFetch
     globalThis.setTimeout = originalSetTimeout
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearTimeout = originalClearTimeout
+    globalThis.clearInterval = originalClearInterval
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch
     globalThis.setTimeout = originalSetTimeout
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearTimeout = originalClearTimeout
+    globalThis.clearInterval = originalClearInterval
+
+    if (originalConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME
+    } else {
+      process.env.XDG_CONFIG_HOME = originalConfigHome
+    }
+
+    if (tempConfigHome) {
+      await rm(tempConfigHome, { recursive: true, force: true })
+    }
   })
 
   test('returns empty object for non-oauth auth', async () => {
@@ -590,6 +657,100 @@ describe('auth.loader', () => {
     const sentBody = JSON.parse(tokenRequestBodies[0] ?? '{}')
     expect(sentBody.refresh_token).toBe('rotated-refresh-from-storage')
     expect(sentBody.refresh_token).not.toBe('stale-refresh')
+  })
+
+  test('multi-account retries use per-request state instead of shared retry budget', async () => {
+    await writeMultiAccountConfig()
+
+    let messageCallCount = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+
+      if (url.includes('/v1/messages')) {
+        messageCallCount += 1
+        return Promise.resolve(
+          new Response(null, {
+            status: messageCallCount % 2 === 1 ? 429 : 200,
+          }),
+        )
+      }
+
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'unused-access',
+          refresh: 'unused-refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const first = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const second = await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(messageCallCount).toBe(4)
+  })
+
+  test('loader clears existing background timers before creating new ones', async () => {
+    await writeMultiAccountConfig()
+
+    const timeoutIds = [101, 202]
+    const intervalIds = [303, 404]
+    const setTimeoutMock = mock(() => timeoutIds.shift() ?? 0)
+    const setIntervalMock = mock(() => intervalIds.shift() ?? 0)
+    const clearTimeoutMock = mock(() => undefined)
+    const clearIntervalMock = mock(() => undefined)
+
+    globalThis.setTimeout = setTimeoutMock as unknown as typeof setTimeout
+    globalThis.setInterval = setIntervalMock as unknown as typeof setInterval
+    globalThis.clearTimeout = clearTimeoutMock as unknown as typeof clearTimeout
+    globalThis.clearInterval =
+      clearIntervalMock as unknown as typeof clearInterval
+
+    const plugin = await getPlugin(createMockClient())
+    const getAuth = () =>
+      Promise.resolve({
+        type: 'oauth',
+        access: 'token',
+        refresh: 'refresh',
+        expires: Date.now() + 100000,
+      })
+
+    await plugin.auth.loader(getAuth, { models: {} })
+    await plugin.auth.loader(getAuth, { models: {} })
+
+    expect(clearTimeoutMock).toHaveBeenCalledWith(101)
+    expect(clearIntervalMock).toHaveBeenCalledWith(303)
+    expect(setTimeoutMock).toHaveBeenCalledTimes(2)
+    expect(setIntervalMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('loader throws when the multi-account config is invalid', async () => {
+    const path = configPath()
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, '{not-json', 'utf8')
+
+    const plugin = await getPlugin()
+
+    await expect(
+      plugin.auth.loader(
+        () =>
+          Promise.resolve({
+            type: 'oauth',
+            access: 'token',
+            refresh: 'refresh',
+            expires: Date.now() + 100000,
+          }),
+        { models: {} },
+      ),
+    ).rejects.toThrow('Invalid anthropic multi-account config')
   })
 
   test('fetch wrapper adds beta=true to /v1/messages URL', async () => {

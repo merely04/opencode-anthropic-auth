@@ -13,6 +13,7 @@ function createConfig(
   return {
     version: 1,
     activeAccountId: accountIds[0] ?? '',
+    primaryAccountId: accountIds[0],
     thresholds: {
       fiveHour: 0.8,
       sevenDay: 0.8,
@@ -64,7 +65,7 @@ describe('createRotationManager', () => {
       config: createConfig(['account-1']),
     })
 
-    expect(manager.decide('account-1', 429)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
   })
 
   test('returns stay when utilization is below thresholds', () => {
@@ -78,7 +79,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.2, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('returns switch with retry on 429', () => {
@@ -88,11 +89,31 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 429)).toEqual({
+    expect(manager.decide('account-1', 429, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: true,
     })
+  })
+
+  test('uses per-request retry state instead of shared global retry budget', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2']),
+    })
+
+    manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
+
+    expect(manager.decide('account-1', 429, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-2',
+      retry: true,
+    })
+    expect(manager.decide('account-1', 429, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-2',
+      retry: true,
+    })
+    expect(manager.decide('account-1', 429, 1)).toEqual({ action: 'stay' })
   })
 
   test('returns switch without retry on allowed_warning above threshold', () => {
@@ -106,7 +127,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: false,
@@ -188,7 +209,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: false,
@@ -196,7 +217,7 @@ describe('createRotationManager', () => {
 
     now += 1_000
 
-    expect(manager.decide('account-1', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('429 ignores cooldown', () => {
@@ -210,7 +231,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: false,
@@ -218,7 +239,7 @@ describe('createRotationManager', () => {
 
     now += 1_000
 
-    expect(manager.decide('account-1', 429)).toEqual({
+    expect(manager.decide('account-1', 429, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: true,
@@ -237,7 +258,7 @@ describe('createRotationManager', () => {
     manager.updateRateState('account-2', createRateInfo('allowed', 0.7, 0.7))
     manager.updateRateState('account-3', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-3',
       retry: false,
@@ -255,7 +276,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-3',
       retry: false,
@@ -270,7 +291,7 @@ describe('createRotationManager', () => {
     manager.updateRateState('account-2', createRateInfo('rejected', 0.2, 0.2))
     manager.updateRateState('account-3', createRateInfo('rejected', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 429)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
   })
 
   test('decide skips disabled accounts', () => {
@@ -287,7 +308,7 @@ describe('createRotationManager', () => {
     manager.updateRateState('account-3', createRateInfo('allowed', 0.4, 0.4))
     manager.recordFailure('account-2')
 
-    expect(manager.decide('account-1', 200)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-3',
       retry: false,
@@ -307,7 +328,7 @@ describe('createRotationManager', () => {
 
     now += 1_000
 
-    expect(manager.decide('account-1', 429)).toEqual({
+    expect(manager.decide('account-1', 429, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: true,
@@ -327,7 +348,7 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('returns stay when proactiveSwitch=false even with high utilization, but still switches on 429', () => {
@@ -343,8 +364,8 @@ describe('createRotationManager', () => {
     )
     manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
 
-    expect(manager.decide('account-1', 200)).toEqual({ action: 'stay' })
-    expect(manager.decide('account-1', 429)).toEqual({
+    expect(manager.decide('account-1', 200, 0)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 429, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-2',
       retry: true,
@@ -360,9 +381,28 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
+      retry: false,
+    })
+  })
+
+  test('uses explicit primaryAccountId instead of accounts[0]', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2', 'account-3'], {
+        activeAccountId: 'account-1',
+        primaryAccountId: 'account-3',
+        proactiveSwitch: false,
+      }),
+      cooldownMs: 0,
+    })
+
+    manager.updateRateState('account-3', createRateInfo('allowed', 0.1, 0.1))
+
+    expect(manager.decide('account-1', 200, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-3',
       retry: false,
     })
   })
@@ -376,7 +416,7 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-1', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-1', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('respects the configured primary recovery interval', () => {
@@ -390,17 +430,17 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
       retry: false,
     })
 
     now += 4_000
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
 
     now += 1_000
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
       retry: false,
@@ -417,15 +457,15 @@ describe('createRotationManager', () => {
     })
 
     manager.updateRateState('account-1', createRateInfo('rejected', 0.2, 0.2))
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
     now += 4_000
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
 
     now += 1_000
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
       retry: false,
@@ -443,7 +483,7 @@ describe('createRotationManager', () => {
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
     manager.recordFailure('account-1')
 
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('does not switch back to a rejected primary account', () => {
@@ -455,7 +495,7 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('rejected', 0.2, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('does not switch back when the primary account still exceeds thresholds', () => {
@@ -467,7 +507,7 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.9, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('disables primary recovery when primaryRecoveryIntervalMs is zero', () => {
@@ -480,7 +520,7 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
   })
 
   test('uses the default primary recovery interval when not configured', () => {
@@ -493,17 +533,17 @@ describe('createRotationManager', () => {
 
     manager.updateRateState('account-1', createRateInfo('allowed', 0.2, 0.2))
 
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
       retry: false,
     })
 
     now += DEFAULT_PRIMARY_RECOVERY_INTERVAL_MS - 1
-    expect(manager.decide('account-2', 200)).toEqual({ action: 'stay' })
+    expect(manager.decide('account-2', 200, 0)).toEqual({ action: 'stay' })
 
     now += 1
-    expect(manager.decide('account-2', 200)).toEqual({
+    expect(manager.decide('account-2', 200, 0)).toEqual({
       action: 'switch',
       targetAccountId: 'account-1',
       retry: false,

@@ -95,7 +95,11 @@ export function createRotationManager(opts: {
   recordFailure(accountId: string): void
   recordSuccess(accountId: string): void
   isDisabled(accountId: string): boolean
-  decide(currentAccountId: string, responseStatus: number): RotationDecision
+  decide(
+    currentAccountId: string,
+    responseStatus: number,
+    currentRetryCount: number,
+  ): RotationDecision
   getRateState(accountId: string): AccountRateState | undefined
 } {
   const rateStates = new Map<string, AccountRateState>()
@@ -112,7 +116,6 @@ export function createRotationManager(opts: {
     DEFAULT_CIRCUIT_BREAKER_RESET_MS
   let lastSwitchTime = 0
   let lastRecoveryCheckTime = 0
-  let retryCount = 0
 
   function getCircuitBreakerState(accountId: string): CircuitBreakerState {
     const existing = circuitBreakerStates.get(accountId)
@@ -168,17 +171,17 @@ export function createRotationManager(opts: {
 
     isDisabled,
 
-    decide(currentAccountId: string, responseStatus: number): RotationDecision {
-      if (responseStatus !== 429) {
-        retryCount = 0
-      }
-
+    decide(
+      currentAccountId: string,
+      responseStatus: number,
+      currentRetryCount: number,
+    ): RotationDecision {
       if (opts.config.accounts.length <= 1) {
         return { action: 'stay' }
       }
 
       if (responseStatus === 429) {
-        if (retryCount >= maxRetries) {
+        if (currentRetryCount >= maxRetries) {
           return { action: 'stay' }
         }
 
@@ -192,7 +195,6 @@ export function createRotationManager(opts: {
           return { action: 'stay' }
         }
 
-        retryCount += 1
         lastSwitchTime = Date.now()
         return { action: 'switch', targetAccountId, retry: true }
       }
@@ -218,7 +220,11 @@ export function createRotationManager(opts: {
         }
       }
 
-      const primaryAccount = opts.config.accounts[0]
+      const primaryAccountId =
+        opts.config.primaryAccountId ?? opts.config.accounts[0]?.id
+      const primaryAccount = opts.config.accounts.find(
+        (account) => account.id === primaryAccountId,
+      )
       if (!primaryAccount) {
         return { action: 'stay' }
       }
