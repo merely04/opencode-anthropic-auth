@@ -68,6 +68,80 @@ The Anthropic API for Max subscriptions has specific requirements for the system
 
 Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The sanitized system prompt is structured as three blocks in `system[]`: the billing header, the Claude Code identity line, and the remaining system content.
 
+## Multi-Account Rotation
+
+### Overview
+
+The plugin supports a pool of Claude Max accounts. When one account approaches its rate limit (5-hour or 7-day window), the plugin automatically switches to the least-utilized account for the next request. This keeps you working without manual intervention when one account's quota runs low.
+
+### Setup
+
+1. Log in normally using **Claude Pro/Max** to set up your first account.
+2. Open the auth menu and select **Add Account to Pool** to add additional accounts. The first time you do this, your current credentials are automatically imported as the first entry.
+3. Repeat for each additional account.
+
+This creates `~/.config/opencode/anthropic-accounts.json`, which stores all account credentials and rotation state.
+
+### How It Works
+
+- Every API response is inspected for Anthropic rate-limit headers.
+- When utilization exceeds the configured threshold (default: 80%), the plugin proactively switches to the least-utilized account before the next request.
+- On a `429` response, the plugin immediately switches accounts and retries.
+- The first account in `accounts[]` is treated as the primary account. Reorder the array in `anthropic-accounts.json` to change which account the plugin prefers to return to.
+- The strategy is **sticky** — the plugin stays on one account until limits are hit, which preserves the prompt cache.
+- A background refresh runs every 45 minutes to keep inactive accounts' tokens alive, so they are ready for an immediate switch when needed.
+
+### Configuration
+
+`~/.config/opencode/anthropic-accounts.json`:
+
+```json
+{
+  "version": 1,
+  "activeAccountId": "uuid-of-active-account",
+  "thresholds": {
+    "fiveHour": 0.80,
+    "sevenDay": 0.80
+  },
+  "proactiveSwitch": true,
+  "maxRetries": 1,
+  "accounts": [
+    {
+      "id": "uuid",
+      "label": "team-account-1",
+      "refresh": "...",
+      "access": "...",
+      "expires": 1234567890000,
+      "addedAt": "2026-04-17T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+| Option | Description | Default |
+|---|---|---|
+| `thresholds.fiveHour` | Utilization threshold for the 5-hour window (0.0–1.0) | `0.80` |
+| `thresholds.sevenDay` | Utilization threshold for the 7-day window (0.0–1.0) | `0.80` |
+| `proactiveSwitch` | Switch accounts proactively based on utilization headers. Set to `false` to only switch on actual `429` errors. | `true` |
+| `maxRetries` | Maximum number of account switches to attempt on a `429` | `1` |
+| `primaryRecoveryIntervalMs` | How often to check if the primary (first) account has recovered, in ms. Set to `0` to disable. | `3600000` (60 min) |
+
+### Managing Accounts
+
+- **Add an account**: Select **Add Account to Pool** from the auth menu.
+- **Remove an account**: Select **Remove Account from Pool** from the auth menu.
+
+### Security
+
+> [!WARNING]
+> Account credentials (including refresh tokens) are stored in plaintext in `~/.config/opencode/anthropic-accounts.json`. This is consistent with how OpenCode stores credentials in its own state directory. Ensure appropriate file permissions on this file.
+
+### Backward Compatibility
+
+- Without a config file, the plugin behaves identically to before.
+- A config file with a single account also uses the original code path.
+- Multi-account rotation only activates with 2 or more accounts in the pool.
+
 ## Development
 
 ### Local Testing
