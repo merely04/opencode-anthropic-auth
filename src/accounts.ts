@@ -224,7 +224,14 @@ async function refreshAccountTokens(opts: {
         expires: Date.now() + json.expires_in * 1000,
       }
 
-      await opts.onTokensRefreshed(opts.account.id, tokens)
+      try {
+        await opts.onTokensRefreshed(opts.account.id, tokens)
+      } catch (persistError) {
+        console.warn(
+          `[anthropic-auth] token refresh for account ${opts.account.id} succeeded remotely but local persistence failed; in-memory tokens will be used for this session:`,
+          persistError,
+        )
+      }
       return tokens.access
     } catch (error) {
       if (attempt < maxRetries && isNetworkError(error)) {
@@ -424,7 +431,13 @@ export async function refreshWithThrottle(
   return results
 }
 
-/** Create a per-account token refresher with inflight deduplication. */
+/**
+ * Create a per-account token refresher with inflight deduplication.
+ *
+ * `onAttemptSuccess` / `onAttemptFailure` fire exactly once per underlying
+ * refresh attempt — NOT once per waiter. This prevents fan-out amplification
+ * of a single remote failure into multiple circuit-breaker increments.
+ */
 export function createAccountRefresher(opts: {
   clientId?: string
   tokenUrl?: string
@@ -432,6 +445,8 @@ export function createAccountRefresher(opts: {
     accountId: string,
     tokens: RefreshedTokens,
   ) => Promise<void>
+  onAttemptSuccess?: (accountId: string) => void
+  onAttemptFailure?: (accountId: string, error: unknown) => void
 }): {
   refresh(account: AccountCredentials): Promise<string>
 } {
@@ -444,12 +459,23 @@ export function createAccountRefresher(opts: {
       const existing = inflight.get(account.id)
       if (existing) return existing
 
-      const refreshPromise = refreshAccountTokens({
+      const attempt = refreshAccountTokens({
         account,
         clientId,
         tokenUrl,
         onTokensRefreshed: opts.onTokensRefreshed,
-      }).finally(() => {
+      }).then(
+        (access) => {
+          opts.onAttemptSuccess?.(account.id)
+          return access
+        },
+        (error) => {
+          opts.onAttemptFailure?.(account.id, error)
+          throw error
+        },
+      )
+
+      const refreshPromise = attempt.finally(() => {
         inflight.delete(account.id)
       })
 

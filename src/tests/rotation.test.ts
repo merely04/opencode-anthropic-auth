@@ -294,6 +294,98 @@ describe('createRotationManager', () => {
     expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
   })
 
+  test('non-primary rejected account becomes eligible again after recovery interval', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2', 'account-3']),
+      rejectedRecoveryIntervalMs: 60_000,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.2, 0.2))
+    manager.updateRateState('account-3', createRateInfo('rejected', 0.1, 0.1))
+
+    expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
+
+    now += 60_001
+
+    const decision = manager.decide('account-1', 429, 0)
+    expect(decision.action).toBe('switch')
+    if (decision.action === 'switch') {
+      expect(decision.retry).toBe(true)
+      expect(['account-2', 'account-3']).toContain(decision.targetAccountId)
+    }
+  })
+
+  test('picks lowest-utilization recovered rejected account', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2', 'account-3']),
+      rejectedRecoveryIntervalMs: 60_000,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.8, 0.9))
+    manager.updateRateState('account-3', createRateInfo('rejected', 0.2, 0.3))
+
+    now += 60_001
+
+    expect(manager.decide('account-1', 429, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-3',
+      retry: true,
+    })
+  })
+
+  test('recovery interval resets timer only when status actually changes', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2']),
+      rejectedRecoveryIntervalMs: 60_000,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.2, 0.2))
+
+    now += 30_000
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.3, 0.3))
+
+    now += 30_001
+
+    expect(manager.decide('account-1', 429, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-2',
+      retry: true,
+    })
+  })
+
+  test('recovering to allowed clears rejectedAt so fresh rejection starts a new timer', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2']),
+      rejectedRecoveryIntervalMs: 60_000,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.2, 0.2))
+
+    now += 70_000
+    manager.updateRateState('account-2', createRateInfo('allowed', 0.1, 0.1))
+
+    expect(manager.decide('account-1', 429, 0)).toEqual({
+      action: 'switch',
+      targetAccountId: 'account-2',
+      retry: true,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.9, 0.9))
+    expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
+  })
+
+  test('rejectedRecoveryIntervalMs <= 0 preserves legacy permanent-exclusion behavior', () => {
+    const manager = createRotationManager({
+      config: createConfig(['account-1', 'account-2']),
+      rejectedRecoveryIntervalMs: 0,
+    })
+
+    manager.updateRateState('account-2', createRateInfo('rejected', 0.2, 0.2))
+
+    now += 60 * 60 * 1000
+    expect(manager.decide('account-1', 429, 0)).toEqual({ action: 'stay' })
+  })
+
   test('decide skips disabled accounts', () => {
     const manager = createRotationManager({
       config: createConfig(['account-1', 'account-2', 'account-3']),

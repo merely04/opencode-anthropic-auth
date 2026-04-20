@@ -351,6 +351,131 @@ describe('accounts config helpers', () => {
     ])
   })
 
+  test('createAccountRefresher fires onAttemptSuccess exactly once per attempt regardless of waiter count', async () => {
+    const account = createConfig().accounts[0]
+    let resolveResponse: ((response: Response) => void) | undefined
+    const pendingResponse = new Promise<Response>((resolve) => {
+      resolveResponse = resolve
+    })
+
+    globalThis.fetch = mock(() => pendingResponse) as unknown as typeof fetch
+
+    const successSpy = mock((_accountId: string) => undefined)
+    const failureSpy = mock((_accountId: string, _error: unknown) => undefined)
+
+    const refresher = createAccountRefresher({
+      clientId: 'client-id',
+      tokenUrl: 'https://example.com/oauth/token',
+      onTokensRefreshed: async () => {},
+      onAttemptSuccess: successSpy,
+      onAttemptFailure: failureSpy,
+    })
+
+    const waiters = Array.from({ length: 5 }, () => refresher.refresh(account!))
+
+    resolveResponse?.(
+      new Response(
+        JSON.stringify({
+          refresh_token: 'r',
+          access_token: 'fresh-access',
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      ),
+    )
+
+    const tokens = await Promise.all(waiters)
+
+    expect(tokens).toEqual(Array(5).fill('fresh-access'))
+    expect(successSpy).toHaveBeenCalledTimes(1)
+    expect(successSpy).toHaveBeenCalledWith('account-1')
+    expect(failureSpy).not.toHaveBeenCalled()
+  })
+
+  test('createAccountRefresher fires onAttemptFailure exactly once per attempt regardless of waiter count', async () => {
+    const account = createConfig().accounts[0]
+    let rejectResponse: ((reason: unknown) => void) | undefined
+    const pendingResponse = new Promise<Response>((_resolve, reject) => {
+      rejectResponse = reject
+    })
+
+    globalThis.fetch = mock(() => pendingResponse) as unknown as typeof fetch
+
+    const successSpy = mock((_accountId: string) => undefined)
+    const failureSpy = mock((_accountId: string, _error: unknown) => undefined)
+
+    const refresher = createAccountRefresher({
+      clientId: 'client-id',
+      tokenUrl: 'https://example.com/oauth/token',
+      onTokensRefreshed: async () => {},
+      onAttemptSuccess: successSpy,
+      onAttemptFailure: failureSpy,
+    })
+
+    const waiters = Array.from({ length: 5 }, () =>
+      refresher.refresh(account!).then(
+        () => 'ok' as const,
+        () => 'fail' as const,
+      ),
+    )
+
+    rejectResponse?.(new Error('fetch failed'))
+
+    const outcomes = await Promise.all(waiters)
+
+    expect(outcomes).toEqual(Array(5).fill('fail'))
+    expect(failureSpy).toHaveBeenCalledTimes(1)
+    expect(failureSpy).toHaveBeenCalledWith('account-1', expect.any(Error))
+    expect(successSpy).not.toHaveBeenCalled()
+  })
+
+  test('createAccountRefresher returns access token and fires onAttemptSuccess even when onTokensRefreshed throws', async () => {
+    const account = createConfig().accounts[0]
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            refresh_token: 'fresh-refresh',
+            access_token: 'fresh-access',
+            expires_in: 3600,
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+
+    const persistError = new Error('ENOSPC: disk full')
+    const successSpy = mock((_accountId: string) => undefined)
+    const failureSpy = mock((_accountId: string, _error: unknown) => undefined)
+    const warnSpy = mock((..._args: unknown[]) => undefined)
+    const originalWarn = console.warn
+    console.warn = warnSpy as unknown as typeof console.warn
+
+    try {
+      const refresher = createAccountRefresher({
+        clientId: 'client-id',
+        tokenUrl: 'https://example.com/oauth/token',
+        onTokensRefreshed: async () => {
+          throw persistError
+        },
+        onAttemptSuccess: successSpy,
+        onAttemptFailure: failureSpy,
+      })
+
+      const access = await refresher.refresh(account!)
+
+      expect(access).toBe('fresh-access')
+      expect(successSpy).toHaveBeenCalledTimes(1)
+      expect(failureSpy).not.toHaveBeenCalled()
+      expect(warnSpy).toHaveBeenCalled()
+      const warnCall = warnSpy.mock.calls[0] as unknown[]
+      expect(warnCall[warnCall.length - 1]).toBe(persistError)
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
   test('createAccountRefresher calls onTokensRefreshed', async () => {
     const account = createConfig().accounts[0]
     let refreshed:

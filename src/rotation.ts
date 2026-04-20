@@ -43,12 +43,25 @@ function exceedsThreshold(
   )
 }
 
+function isRejectedAndUnrecovered(
+  state: AccountRateState | undefined,
+  rejectedRecoveryMs: number,
+  now: number,
+): boolean {
+  if (state?.lastInfo?.status !== 'rejected') return false
+  if (rejectedRecoveryMs <= 0) return true
+  if (state.rejectedAt == null) return true
+  return now - state.rejectedAt < rejectedRecoveryMs
+}
+
 function findBestAlternateAccount(
   config: AccountsConfig,
   rateStates: Map<string, AccountRateState>,
   currentAccountId: string,
   isDisabled: (accountId: string) => boolean,
+  rejectedRecoveryMs: number,
 ): string | null {
+  const now = Date.now()
   let bestAccountId: string | null = null
   let bestScore = Number.POSITIVE_INFINITY
 
@@ -57,7 +70,7 @@ function findBestAlternateAccount(
     if (isDisabled(account.id)) continue
 
     const state = rateStates.get(account.id)
-    if (state?.lastInfo?.status === 'rejected') continue
+    if (isRejectedAndUnrecovered(state, rejectedRecoveryMs, now)) continue
 
     const score = maxUtilization(state?.lastInfo)
     if (score < bestScore) {
@@ -90,6 +103,7 @@ export function createRotationManager(opts: {
   cooldownMs?: number
   maxConsecutiveFailures?: number
   circuitBreakerResetMs?: number
+  rejectedRecoveryIntervalMs?: number
 }): {
   updateRateState(accountId: string, info: RateLimitInfo): void
   recordFailure(accountId: string): void
@@ -114,6 +128,10 @@ export function createRotationManager(opts: {
     opts.circuitBreakerResetMs ??
     opts.config.circuitBreakerResetMs ??
     DEFAULT_CIRCUIT_BREAKER_RESET_MS
+  const rejectedRecoveryMs =
+    opts.rejectedRecoveryIntervalMs ??
+    opts.config.rejectedRecoveryIntervalMs ??
+    DEFAULT_PRIMARY_RECOVERY_INTERVAL_MS
   let lastSwitchTime = 0
   let lastRecoveryCheckTime = 0
 
@@ -145,10 +163,20 @@ export function createRotationManager(opts: {
 
   return {
     updateRateState(accountId: string, info: RateLimitInfo): void {
+      const now = Date.now()
+      const previous = rateStates.get(accountId)
+      const rejectedAt =
+        info.status === 'rejected'
+          ? previous?.lastInfo?.status === 'rejected' &&
+            previous.rejectedAt != null
+            ? previous.rejectedAt
+            : now
+          : undefined
       rateStates.set(accountId, {
         accountId,
         lastInfo: info,
-        lastUpdated: Date.now(),
+        lastUpdated: now,
+        rejectedAt,
       })
     },
 
@@ -190,6 +218,7 @@ export function createRotationManager(opts: {
           rateStates,
           currentAccountId,
           isDisabled,
+          rejectedRecoveryMs,
         )
         if (!targetAccountId) {
           return { action: 'stay' }
@@ -211,6 +240,7 @@ export function createRotationManager(opts: {
               rateStates,
               currentAccountId,
               isDisabled,
+              rejectedRecoveryMs,
             )
             if (targetAccountId) {
               lastSwitchTime = Date.now()

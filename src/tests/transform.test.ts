@@ -455,6 +455,87 @@ describe('createStrippedStream', () => {
     const result = createStrippedStream(original)
     expect(result).toBe(original)
   })
+
+  test('strips tool prefixes across arbitrary chunk boundaries', async () => {
+    const fullPayload =
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash","id":"1"}}\n\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_read","id":"2"}}\n\n'
+
+    for (const chunkSize of [1, 3, 7, 13, 32]) {
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream({
+        start(controller) {
+          for (let i = 0; i < fullPayload.length; i += chunkSize) {
+            controller.enqueue(
+              encoder.encode(fullPayload.slice(i, i + chunkSize)),
+            )
+          }
+          controller.close()
+        },
+      })
+
+      const original = new Response(stream, { status: 200 })
+      const stripped = createStrippedStream(original)
+      const text = await stripped.text()
+
+      expect(text).toContain('"name": "bash"')
+      expect(text).toContain('"name": "read"')
+      expect(text).not.toContain('mcp_bash')
+      expect(text).not.toContain('mcp_read')
+      expect(text.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('propagates consumer cancellation to upstream reader', async () => {
+    let upstreamCancelled = false
+    let upstreamCancelReason: unknown
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        controller.enqueue(encoder.encode('data: '))
+      },
+      cancel(reason) {
+        upstreamCancelled = true
+        upstreamCancelReason = reason
+      },
+    })
+
+    const original = new Response(stream, { status: 200 })
+    const stripped = createStrippedStream(original)
+
+    const reader = stripped.body!.getReader()
+    await reader.cancel('consumer-abort')
+
+    expect(upstreamCancelled).toBe(true)
+    expect(upstreamCancelReason).toBe('consumer-abort')
+  })
+
+  test('propagates upstream errors to the consumer', async () => {
+    const upstreamError = new Error('upstream boom')
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.error(upstreamError)
+      },
+    })
+
+    const original = new Response(stream, { status: 200 })
+    const stripped = createStrippedStream(original)
+
+    await expect(stripped.text()).rejects.toThrow('upstream boom')
+  })
+
+  test('handles empty upstream stream without corrupting output', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.close()
+      },
+    })
+
+    const original = new Response(stream, { status: 200 })
+    const stripped = createStrippedStream(original)
+
+    expect(await stripped.text()).toBe('')
+  })
 })
 
 describe('sanitizeSystemText', () => {

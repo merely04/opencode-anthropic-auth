@@ -17,6 +17,8 @@ export interface AccountsConfig {
   circuitBreakerResetMs?: number
   /** Interval in ms to check if primary account has recovered (default: 60 min). Set to 0 to disable. */
   primaryRecoveryIntervalMs?: number
+  /** Interval in ms before a non-primary account with a rejected rate-limit status is eligible for selection again (default: 60 min). Set to 0 or negative to never recover (legacy behavior). */
+  rejectedRecoveryIntervalMs?: number
   accounts: AccountCredentials[]
 }
 
@@ -43,6 +45,8 @@ export interface AccountRateState {
   accountId: string
   lastInfo: RateLimitInfo | null
   lastUpdated: number
+  /** Timestamp (ms) when the account first entered a `rejected` status, preserved across repeated rejections. Unset for non-rejected states. */
+  rejectedAt?: number
 }
 
 /** Circuit breaker state tracked per account in memory. */

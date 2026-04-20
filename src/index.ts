@@ -20,6 +20,7 @@ import {
   createStrippedStream,
   isInsecure,
   mergeHeaders,
+  resolveRequestBodyText,
   rewriteRequestBody,
   rewriteUrl,
   setOAuthHeaders,
@@ -41,6 +42,19 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
   } = {
     timeout: null,
     interval: null,
+  }
+
+  // Shared mutex for every mutation of anthropic-accounts.json — used by
+  // the loader's refresh / switch paths AND by the Add/Remove Account auth
+  // methods, so they can't clobber each other's snapshots.
+  const configMutex = createMutex()
+  const withConfigLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+    const release = await configMutex.acquire()
+    try {
+      return await fn()
+    } finally {
+      release()
+    }
   }
 
   return {
@@ -91,7 +105,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             loadedConfig.config.accounts.length >= 2
           ) {
             const config = loadedConfig.config
-            const mutex = createMutex()
+            const mutex = configMutex
+            const rotation = createRotationManager({ config })
             const refresher = createAccountRefresher({
               onTokensRefreshed: async (accountId, tokens) => {
                 const release = await mutex.acquire()
@@ -123,9 +138,15 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   release()
                 }
               },
+              onAttemptSuccess: (accountId) => {
+                rotation.recordSuccess(accountId)
+              },
+              onAttemptFailure: (accountId, error) => {
+                if (isAuthError(error)) {
+                  rotation.recordFailure(accountId)
+                }
+              },
             })
-
-            const rotation = createRotationManager({ config })
 
             const setClientAuth = async (account: AccountCredentials) => {
               // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
@@ -201,16 +222,13 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
                 try {
                   await refresher.refresh(active)
-                  rotation.recordSuccess(active.id)
                   const refreshed =
                     config.accounts.find(
                       (account) => account.id === active.id,
                     ) ?? active
                   return refreshed
                 } catch (error) {
-                  if (isAuthError(error)) {
-                    rotation.recordFailure(active.id)
-                  } else {
+                  if (!isAuthError(error)) {
                     throw error
                   }
 
@@ -256,22 +274,11 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 )
               })
 
-              const results = await refreshWithThrottle(
+              await refreshWithThrottle(
                 accountsToRefresh,
                 (account) => refresher.refresh(account),
                 REFRESH_CONCURRENCY,
               )
-
-              for (const result of results) {
-                if (result.success) {
-                  rotation.recordSuccess(result.accountId)
-                  continue
-                }
-
-                if (isAuthError(result.error)) {
-                  rotation.recordFailure(result.accountId)
-                }
-              }
             }
 
             // Kick off an initial background refresh shortly after startup
@@ -296,19 +303,19 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   const requestHeaders = mergeHeaders(input, init)
                   setOAuthHeaders(requestHeaders, active.access)
 
-                  let body = init?.body
-                  if (body && typeof body === 'string') {
-                    body = rewriteRequestBody(body)
-                  }
-
+                  const bodyText = await resolveRequestBodyText(input, init)
                   const rewritten = rewriteUrl(input)
 
-                  const response = await fetch(rewritten.input, {
+                  const fetchInit: RequestInit = {
                     ...init,
-                    body,
                     headers: requestHeaders,
                     ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-                  })
+                  }
+                  if (bodyText != null) {
+                    fetchInit.body = rewriteRequestBody(bodyText)
+                  }
+
+                  const response = await fetch(rewritten.input, fetchInit)
 
                   const rateInfo = parseRateLimitHeaders(response)
                   if (rateInfo) {
@@ -400,18 +407,25 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                           expires_in: number
                         }
 
-                        // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                        await (client as any).auth.set({
-                          path: {
-                            id: 'anthropic',
-                          },
-                          body: {
-                            type: 'oauth',
-                            refresh: json.refresh_token,
-                            access: json.access_token,
-                            expires: Date.now() + json.expires_in * 1000,
-                          },
-                        })
+                        try {
+                          // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+                          await (client as any).auth.set({
+                            path: {
+                              id: 'anthropic',
+                            },
+                            body: {
+                              type: 'oauth',
+                              refresh: json.refresh_token,
+                              access: json.access_token,
+                              expires: Date.now() + json.expires_in * 1000,
+                            },
+                          })
+                        } catch (persistError) {
+                          console.warn(
+                            '[anthropic-auth] token refresh succeeded remotely but local persistence failed; in-memory access token will be used for this request:',
+                            persistError,
+                          )
+                        }
 
                         return json.access_token
                       } catch (error) {
@@ -445,19 +459,19 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
               setOAuthHeaders(requestHeaders, auth.access!)
 
-              let body = init?.body
-              if (body && typeof body === 'string') {
-                body = rewriteRequestBody(body)
-              }
-
+              const bodyText = await resolveRequestBodyText(input, init)
               const rewritten = rewriteUrl(input)
 
-              const response = await fetch(rewritten.input, {
+              const fetchInit: RequestInit = {
                 ...init,
-                body,
                 headers: requestHeaders,
                 ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-              })
+              }
+              if (bodyText != null) {
+                fetchInit.body = rewriteRequestBody(bodyText)
+              }
+
+              const response = await fetch(rewritten.input, fetchInit)
 
               return createStrippedStream(response)
             },
@@ -504,7 +518,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   result.state,
                 )
                 if (credentials.type === 'failed') return credentials
-                const apiKey = await fetch(
+                const response = await fetch(
                   `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
                   {
                     method: 'POST',
@@ -513,7 +527,20 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       authorization: `Bearer ${credentials.access}`,
                     },
                   },
-                ).then((r) => r.json() as Promise<{ raw_key: string }>)
+                )
+                if (!response.ok) {
+                  await response.body?.cancel()
+                  return { type: 'failed' as const }
+                }
+                const apiKey = (await response.json()) as {
+                  raw_key?: unknown
+                }
+                if (
+                  typeof apiKey.raw_key !== 'string' ||
+                  apiKey.raw_key.length === 0
+                ) {
+                  return { type: 'failed' as const }
+                }
                 return { type: 'success' as const, key: apiKey.raw_key }
               },
             }
@@ -528,31 +555,31 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           label: 'Add Account to Pool',
           type: 'oauth',
           authorize: async () => {
-            const loadedConfig = await loadConfig()
-            if (loadedConfig.status === 'invalid') {
-              throw new Error(
-                `Invalid anthropic multi-account config: ${loadedConfig.error}`,
-              )
-            }
-
-            let config =
-              loadedConfig.status === 'ok' ? loadedConfig.config : null
-            if (!config && capturedGetAuth) {
-              const currentAuth = await capturedGetAuth()
-              if (
-                currentAuth.type === 'oauth' &&
-                currentAuth.refresh &&
-                currentAuth.access &&
-                currentAuth.expires
-              ) {
-                config = createInitialConfig({
-                  refresh: currentAuth.refresh,
-                  access: currentAuth.access,
-                  expires: currentAuth.expires,
-                })
-                await saveConfig(config)
+            await withConfigLock(async () => {
+              const loadedConfig = await loadConfig()
+              if (loadedConfig.status === 'invalid') {
+                throw new Error(
+                  `Invalid anthropic multi-account config: ${loadedConfig.error}`,
+                )
               }
-            }
+
+              if (loadedConfig.status !== 'ok' && capturedGetAuth !== null) {
+                const currentAuth = await capturedGetAuth()
+                if (
+                  currentAuth.type === 'oauth' &&
+                  currentAuth.refresh &&
+                  currentAuth.access &&
+                  currentAuth.expires
+                ) {
+                  const seed = createInitialConfig({
+                    refresh: currentAuth.refresh,
+                    access: currentAuth.access,
+                    expires: currentAuth.expires,
+                  })
+                  await saveConfig(seed)
+                }
+              }
+            })
 
             const result = await authorize('max')
             return {
@@ -568,24 +595,29 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 )
                 if (creds.type === 'failed') return creds
 
-                const final = config
-                  ? (() => {
-                      const { config: updated, accountId } = addAccount(
-                        config,
-                        {
-                          refresh: creds.refresh,
-                          access: creds.access,
-                          expires: creds.expires,
-                        },
-                      )
-                      return switchActiveAccount(updated, accountId)
-                    })()
-                  : createInitialConfig({
-                      refresh: creds.refresh,
-                      access: creds.access,
-                      expires: creds.expires,
-                    })
-                await saveConfig(final)
+                await withConfigLock(async () => {
+                  const fresh = await loadConfig()
+                  const baseConfig = fresh.status === 'ok' ? fresh.config : null
+
+                  const final = baseConfig
+                    ? (() => {
+                        const { config: updated, accountId } = addAccount(
+                          baseConfig,
+                          {
+                            refresh: creds.refresh,
+                            access: creds.access,
+                            expires: creds.expires,
+                          },
+                        )
+                        return switchActiveAccount(updated, accountId)
+                      })()
+                    : createInitialConfig({
+                        refresh: creds.refresh,
+                        access: creds.access,
+                        expires: creds.expires,
+                      })
+                  await saveConfig(final)
+                })
 
                 return creds
               },
@@ -596,16 +628,17 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           label: 'Remove Account from Pool',
           type: 'oauth',
           authorize: async () => {
-            const loadedConfig = await loadConfig()
-            if (loadedConfig.status === 'invalid') {
-              throw new Error(
-                `Invalid anthropic multi-account config: ${loadedConfig.error}`,
-              )
-            }
+            const snapshot = await withConfigLock(async () => {
+              const loadedConfig = await loadConfig()
+              if (loadedConfig.status === 'invalid') {
+                throw new Error(
+                  `Invalid anthropic multi-account config: ${loadedConfig.error}`,
+                )
+              }
+              return loadedConfig.status === 'ok' ? loadedConfig.config : null
+            })
 
-            const config =
-              loadedConfig.status === 'ok' ? loadedConfig.config : null
-            if (!config || config.accounts.length <= 1) {
+            if (!snapshot || snapshot.accounts.length <= 1) {
               return {
                 url: '',
                 instructions:
@@ -615,10 +648,10 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               }
             }
 
-            const accountList = config.accounts
+            const accountList = snapshot.accounts
               .map(
                 (account, index) =>
-                  `${index + 1}. ${account.label || account.id}${account.id === config.activeAccountId ? ' (active)' : ''}`,
+                  `${index + 1}. ${account.label || account.id}${account.id === snapshot.activeAccountId ? ' (active)' : ''}`,
               )
               .join('\n')
 
@@ -628,25 +661,31 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               method: 'code' as const,
               callback: async (input: string) => {
                 const index = Number.parseInt(input.trim(), 10) - 1
-                const account = config.accounts[index]
-                if (!account) return { type: 'failed' as const }
+                const targetId = snapshot.accounts[index]?.id
+                if (!targetId) return { type: 'failed' as const }
 
-                const updated = removeAccount(config, account.id)
-                if (!updated) return { type: 'failed' as const }
+                return await withConfigLock(async () => {
+                  const fresh = await loadConfig()
+                  const baseConfig = fresh.status === 'ok' ? fresh.config : null
+                  if (!baseConfig) return { type: 'failed' as const }
 
-                await saveConfig(updated)
+                  const updated = removeAccount(baseConfig, targetId)
+                  if (!updated) return { type: 'failed' as const }
 
-                const active = getActiveAccount(updated)
-                if (active) {
-                  return {
-                    type: 'success' as const,
-                    refresh: active.refresh,
-                    access: active.access,
-                    expires: active.expires,
+                  await saveConfig(updated)
+
+                  const active = getActiveAccount(updated)
+                  if (active) {
+                    return {
+                      type: 'success' as const,
+                      refresh: active.refresh,
+                      access: active.access,
+                      expires: active.expires,
+                    }
                   }
-                }
 
-                return { type: 'failed' as const }
+                  return { type: 'failed' as const }
+                })
               },
             }
           },

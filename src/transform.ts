@@ -332,6 +332,33 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 }
 
 /**
+ * Extract textual body for rewrite. init.body wins over Request.body
+ * (Fetch spec). Returns null for non-text bodies (Blob/FormData) and
+ * non-JSON Content-Types so they pass through untouched.
+ */
+export async function resolveRequestBodyText(
+  input: FetchInput,
+  init?: RequestInit,
+): Promise<string | null> {
+  const explicit = init?.body
+  if (typeof explicit === 'string') return explicit
+  if (explicit !== undefined && explicit !== null) return null
+
+  if (input instanceof Request && input.body != null) {
+    const contentType = input.headers.get('content-type') ?? ''
+    const isJsonLike = contentType === '' || /json/i.test(contentType)
+    if (!isJsonLike) return null
+    try {
+      return await input.clone().text()
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
+/**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
 export function rewriteRequestBody(body: string): string {
@@ -365,7 +392,17 @@ export function rewriteRequestBody(body: string): string {
 }
 
 /**
- * Create a streaming response that strips the tool prefix from tool names.
+ * Size (chars) held in carry between chunks. Must strictly exceed the
+ * longest possible `"name":"mcp_…"` match so a match that starts anywhere
+ * in text cannot still be in progress past `text.length - STREAM_CARRY_CHARS`.
+ * 256 comfortably covers any realistic tool name + whitespace.
+ */
+const STREAM_CARRY_CHARS = 256
+
+/**
+ * Wrap a streaming response so `stripToolPrefix` runs on the full payload
+ * across arbitrary network chunk boundaries, and consumer cancellation is
+ * forwarded to the upstream reader to stop the underlying download.
  */
 export function createStrippedStream(response: Response): Response {
   if (!response.body) return response
@@ -373,18 +410,42 @@ export function createStrippedStream(response: Response): Response {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  let carry = ''
 
   const stream = new ReadableStream({
     async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) {
+            if (carry.length > 0) {
+              controller.enqueue(encoder.encode(stripToolPrefix(carry)))
+              carry = ''
+            }
+            controller.close()
+            return
+          }
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
+          const text = carry + decoder.decode(value, { stream: true })
+          if (text.length > STREAM_CARRY_CHARS) {
+            const emitLen = text.length - STREAM_CARRY_CHARS
+            const emit = text.slice(0, emitLen)
+            carry = text.slice(emitLen)
+            controller.enqueue(encoder.encode(stripToolPrefix(emit)))
+            return
+          }
+          carry = text
+        }
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason)
+      } catch {
+        // best-effort: reader may already be closed/cancelled
+      }
     },
   })
 

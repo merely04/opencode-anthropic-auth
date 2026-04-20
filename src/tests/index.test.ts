@@ -163,6 +163,126 @@ describe('auth.methods', () => {
   })
 })
 
+describe('Create an API Key callback', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  async function startCreateApiKeyFlow() {
+    const plugin = await getPlugin()
+    const method = plugin.auth.methods[1]
+    const authorizeResult = await method.authorize()
+    const url = new URL(authorizeResult.url)
+    const state = url.searchParams.get('state') ?? ''
+    return {
+      invoke: (code: string) => authorizeResult.callback(`${code}#${state}`),
+    }
+  }
+
+  function tokenExchangeSuccess() {
+    return new Response(
+      JSON.stringify({
+        refresh_token: 'r',
+        access_token: 'a',
+        expires_in: 3600,
+      }),
+      { status: 200 },
+    )
+  }
+
+  test('returns failed when token exchange fails', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(new Response('Bad', { status: 400 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const { invoke } = await startCreateApiKeyFlow()
+    const outcome = await invoke('some-code')
+    expect(outcome).toEqual({ type: 'failed' })
+  })
+
+  test('returns failed when API key creation returns non-ok status', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(tokenExchangeSuccess())
+      }
+      if (url.includes('/create_api_key')) {
+        return Promise.resolve(new Response('Unauthorized', { status: 401 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const { invoke } = await startCreateApiKeyFlow()
+    const outcome = await invoke('some-code')
+    expect(outcome).toEqual({ type: 'failed' })
+  })
+
+  test('returns failed when API key creation body lacks raw_key', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(tokenExchangeSuccess())
+      }
+      if (url.includes('/create_api_key')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'whatever' }), { status: 200 }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const { invoke } = await startCreateApiKeyFlow()
+    const outcome = await invoke('some-code')
+    expect(outcome).toEqual({ type: 'failed' })
+  })
+
+  test('returns failed when API key creation returns empty raw_key', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(tokenExchangeSuccess())
+      }
+      if (url.includes('/create_api_key')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ raw_key: '' }), { status: 200 }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const { invoke } = await startCreateApiKeyFlow()
+    const outcome = await invoke('some-code')
+    expect(outcome).toEqual({ type: 'failed' })
+  })
+
+  test('returns success with key when API key creation succeeds', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(tokenExchangeSuccess())
+      }
+      if (url.includes('/create_api_key')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ raw_key: 'sk-test-123' }), {
+            status: 200,
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const { invoke } = await startCreateApiKeyFlow()
+    const outcome = await invoke('some-code')
+    expect(outcome).toEqual({ type: 'success', key: 'sk-test-123' })
+  })
+})
+
 describe('auth.loader', () => {
   const originalFetch = globalThis.fetch
   const originalSetTimeout = globalThis.setTimeout
@@ -779,5 +899,126 @@ describe('auth.loader', () => {
     })
 
     expect(capturedUrl).toContain('beta=true')
+  })
+
+  test('fetch wrapper rewrites body when caller passes Request instead of init.body', async () => {
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      capturedBody =
+        typeof init?.body === 'string' ? init.body : '<<non-string>>'
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const body = JSON.stringify({
+      tools: [{ name: 'bash', type: 'function' }],
+      messages: [{ role: 'user', content: 'hello' }],
+      system: 'You are a helpful assistant.',
+    })
+
+    const request = new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+
+    await result.fetch(request)
+
+    expect(capturedBody).toBeDefined()
+    expect(capturedBody).not.toBe('<<non-string>>')
+    const parsed = JSON.parse(capturedBody!)
+    expect(parsed.tools[0].name).toBe('mcp_Bash')
+    expect(parsed.system[1].text).toBe(
+      "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    )
+  })
+
+  test('fetch wrapper rewrites Request body in multi-account mode too', async () => {
+    await writeMultiAccountConfig()
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        capturedBody =
+          typeof init?.body === 'string' ? init.body : '<<non-string>>'
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(createMockClient())
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'unused',
+          refresh: 'unused',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const body = JSON.stringify({
+      tools: [{ name: 'read', type: 'function' }],
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'base prompt',
+    })
+
+    const request = new Request(MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+
+    await result.fetch(request)
+
+    expect(capturedBody).toBeDefined()
+    expect(capturedBody).not.toBe('<<non-string>>')
+    const parsed = JSON.parse(capturedBody!)
+    expect(parsed.tools[0].name).toBe('mcp_Read')
+  })
+
+  test('fetch wrapper leaves non-JSON Request body untouched', async () => {
+    let capturedInit: RequestInit | undefined
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      capturedInit = init
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    const request = new Request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: 'mcp_bash raw-binary-data',
+    })
+
+    await result.fetch(request)
+
+    expect(capturedInit).toBeDefined()
+    expect(capturedInit!.body).toBeUndefined()
   })
 })
